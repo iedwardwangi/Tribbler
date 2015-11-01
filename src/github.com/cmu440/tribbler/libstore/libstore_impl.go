@@ -39,27 +39,110 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 }
 
 func (ls *libstore) Get(key string) (string, error) {
-	return "", errors.New("not implemented")
+	// TODO: May need to use cache in the future.
+	args := &storagerpc.GetArgs{key, false, ls.myHostPort}
+	var reply *storagerpc.GetReply
+
+	cli, err := GetStorageServer(key)
+	if err {
+		return nil, errors.New("Get error:", err)
+	}
+
+	err2 := cli.Call("StorageServer.Get", args, &reply)
+	if err2 {
+		return nil, errors.New("Get error:", err2)
+	}
+
+	if reply.Status != storagerpc.OK {
+		return nil, errors.New("Status not OK. Got status:", reply.Status)
+	}
+
+	return reply.Value, nil
 }
 
 func (ls *libstore) Put(key, value string) error {
-	return errors.New("not implemented")
+	args := &storagerpc.PutArgs{key, value}
+	var reply *storagerpc.PutReply
+
+	err := ls.svr.Call("StorageServer.Put", args, &reply)
+	if err {
+		return errors.New("Put error:", err)
+	}
+
+	if reply.Status != storagerpc.OK {
+		return errors.New("Status not OK. Got status:", reply.Status)
+	}
+
+	return nil
 }
 
 func (ls *libstore) Delete(key string) error {
-	return errors.New("not implemented")
+	args := &storagerpc.DeleteArgs{key}
+	var reply *storagerpc.DeleteReply
+
+	err := ls.svr.Call("StorageServer.Delete", args, &reply)
+	if err {
+		return errors.New("Delete error:", err)
+	}
+
+	if reply.Status != storagerpc.OK {
+		return errors.New("Status not OK. Got status:", reply.Status)
+	}
+
+	return nil
 }
 
 func (ls *libstore) GetList(key string) ([]string, error) {
-	return nil, errors.New("not implemented")
+	args := &storagerpc.GetArgs{key, false, ls.myHostPort}
+	var reply *storagerpc.GetlistReply
+
+	err := ls.svr.Call("StorageServer.GetList", args, &reply)
+	if err {
+		return nil, errors.New("GetList error:", err)
+	}
+
+	if reply.Status != storagerpc.OK {
+		return nil, errors.New("Status not OK. Got status:", reply.Status)
+	}
+
+	return reply.Value, nil
+}
+
+func (ls *libstore) GetStorageServer(key string) (*rpc.Client, error) {
+	// TODO: that as well.
+	return ls.svr, nil
 }
 
 func (ls *libstore) RemoveFromList(key, removeItem string) error {
-	return errors.New("not implemented")
+	args := &storagerpc.PutArgs{key, removeItem}
+	var reply *storagerpc.PutReply
+
+	err := ls.svr.Call("StorageServer.RemoveFromList", args, &reply)
+	if err {
+		return errors.New("RemoveFromList error:", err)
+	}
+
+	if reply.Status != storagerpc.OK {
+		return errors.New("Status not OK. Got status:", reply.Status)
+	}
+
+	return nil
 }
 
 func (ls *libstore) AppendToList(key, newItem string) error {
-	return errors.New("not implemented")
+	args := &storagerpc.PutArgs{key, newItem}
+	var reply *storagerpc.PutReply
+
+	err := ls.svr.Call("StorageServer.AppendToList", args, &reply)
+	if err {
+		return errors.New("AppendToList error:", err)
+	}
+
+	if reply.Status != storagerpc.OK {
+		return errors.New("Status not OK. Got status:", reply.Status)
+	}
+
+	return nil
 }
 
 func (ls *libstore) RevokeLease(args *storagerpc.RevokeLeaseArgs, reply *storagerpc.RevokeLeaseReply) error {
