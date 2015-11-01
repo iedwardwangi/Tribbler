@@ -2,12 +2,14 @@ package libstore
 
 import (
 	"errors"
-
 	"github.com/cmu440/tribbler/rpc/storagerpc"
+	"net/rpc"
 )
 
 type libstore struct {
-	// TODO: implement this!
+	// TODO: extends to many servers
+	svr        *rpc.Client
+	myHostPort string
 }
 
 // NewLibstore creates a new instance of a TribServer's libstore. masterServerHostPort
@@ -35,7 +37,15 @@ type libstore struct {
 // need to create a brand new HTTP handler to serve the requests (the Libstore may
 // simply reuse the TribServer's HTTP handler since the two run in the same process).
 func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libstore, error) {
-	return nil, errors.New("not implemented")
+	svr, err := rpc.DialHTTP("tcp", masterServerHostPort)
+	if err != nil {
+		return nil, err
+	}
+	newLib := &libstore{
+		svr:        svr,
+		myHostPort: myHostPort,
+	}
+	return newLib, nil
 }
 
 func (ls *libstore) Get(key string) (string, error) {
@@ -43,18 +53,18 @@ func (ls *libstore) Get(key string) (string, error) {
 	args := &storagerpc.GetArgs{key, false, ls.myHostPort}
 	var reply *storagerpc.GetReply
 
-	cli, err := GetStorageServer(key)
-	if err {
-		return nil, errors.New("Get error:", err)
+	cli, err := ls.GetStorageServer(key)
+	if err != nil {
+		return "", err
 	}
 
 	err2 := cli.Call("StorageServer.Get", args, &reply)
-	if err2 {
-		return nil, errors.New("Get error:", err2)
+	if err2 != nil {
+		return "", err2
 	}
 
 	if reply.Status != storagerpc.OK {
-		return nil, errors.New("Status not OK. Got status:", reply.Status)
+		return "", errors.New("Status not OK.")
 	}
 
 	return reply.Value, nil
@@ -65,12 +75,12 @@ func (ls *libstore) Put(key, value string) error {
 	var reply *storagerpc.PutReply
 
 	err := ls.svr.Call("StorageServer.Put", args, &reply)
-	if err {
-		return errors.New("Put error:", err)
+	if err != nil {
+		return err
 	}
 
 	if reply.Status != storagerpc.OK {
-		return errors.New("Status not OK. Got status:", reply.Status)
+		return errors.New("Status not OK.")
 	}
 
 	return nil
@@ -81,12 +91,12 @@ func (ls *libstore) Delete(key string) error {
 	var reply *storagerpc.DeleteReply
 
 	err := ls.svr.Call("StorageServer.Delete", args, &reply)
-	if err {
-		return errors.New("Delete error:", err)
+	if err != nil {
+		return err
 	}
 
 	if reply.Status != storagerpc.OK {
-		return errors.New("Status not OK. Got status:", reply.Status)
+		return errors.New("Status not OK.")
 	}
 
 	return nil
@@ -94,15 +104,15 @@ func (ls *libstore) Delete(key string) error {
 
 func (ls *libstore) GetList(key string) ([]string, error) {
 	args := &storagerpc.GetArgs{key, false, ls.myHostPort}
-	var reply *storagerpc.GetlistReply
+	var reply *storagerpc.GetListReply
 
 	err := ls.svr.Call("StorageServer.GetList", args, &reply)
-	if err {
-		return nil, errors.New("GetList error:", err)
+	if err != nil {
+		return nil, err
 	}
 
 	if reply.Status != storagerpc.OK {
-		return nil, errors.New("Status not OK. Got status:", reply.Status)
+		return nil, errors.New("Status not OK.")
 	}
 
 	return reply.Value, nil
@@ -118,12 +128,12 @@ func (ls *libstore) RemoveFromList(key, removeItem string) error {
 	var reply *storagerpc.PutReply
 
 	err := ls.svr.Call("StorageServer.RemoveFromList", args, &reply)
-	if err {
-		return errors.New("RemoveFromList error:", err)
+	if err != nil {
+		return err
 	}
 
 	if reply.Status != storagerpc.OK {
-		return errors.New("Status not OK. Got status:", reply.Status)
+		return errors.New("Status not OK.")
 	}
 
 	return nil
@@ -134,12 +144,12 @@ func (ls *libstore) AppendToList(key, newItem string) error {
 	var reply *storagerpc.PutReply
 
 	err := ls.svr.Call("StorageServer.AppendToList", args, &reply)
-	if err {
-		return errors.New("AppendToList error:", err)
+	if err != nil {
+		return err
 	}
 
 	if reply.Status != storagerpc.OK {
-		return errors.New("Status not OK. Got status:", reply.Status)
+		return errors.New("Status not OK.")
 	}
 
 	return nil
