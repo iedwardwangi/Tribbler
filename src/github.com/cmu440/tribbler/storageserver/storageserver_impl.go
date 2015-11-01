@@ -129,7 +129,6 @@ func (ss *storageServer) RegisterServer(args *storagerpc.RegisterArgs, reply *st
 	} else {
 		reply.Statis = storagerpc.OK
 		reply.Servers = ss.nodesList
-		ss.serverFull <- 1
 	}
     return nil
 }
