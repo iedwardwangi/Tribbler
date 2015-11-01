@@ -131,19 +131,22 @@ func checkSubscriptions(subs, expectedSubs []string) bool {
 // Check tribbles
 func checkTribbles(tribbles, expectedTribbles []tribrpc.Tribble) bool {
 	if len(tribbles) != len(expectedTribbles) {
-		LOGE.Printf("FAIL: incorrect tribbles %v, expected tribbles %v\n", tribbles, expectedTribbles)
+		LOGE.Printf("FAIL: incorrect tribbles %d, expected tribbles %d\n", len(tribbles), len(expectedTribbles))
 		failCount++
 		return true
 	}
 	lastTime := int64(0)
 	for i := len(tribbles) - 1; i >= 0; i-- {
 		if tribbles[i].UserID != expectedTribbles[i].UserID {
-			LOGE.Printf("FAIL: incorrect tribbles %v, expected tribbles %v\n", tribbles, expectedTribbles)
+			LOGE.Printf("FAIL: incorrect tribbles, expected tribbles\n")
+			for j := 0; j < len(tribbles); j++ {
+				fmt.Println(expectedTribbles[j].UserID, expectedTribbles[j].Contents)
+			}
 			failCount++
 			return true
 		}
 		if tribbles[i].Contents != expectedTribbles[i].Contents {
-			LOGE.Printf("FAIL: incorrect tribbles %v, expected tribbles %v\n", tribbles, expectedTribbles)
+			//LOGE.Printf("FAIL: incorrect tribbles %v, expected tribbles %v\n", tribbles, expectedTribbles)
 			failCount++
 			return true
 		}

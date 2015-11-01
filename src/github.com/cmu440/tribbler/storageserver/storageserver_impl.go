@@ -66,7 +66,9 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		newss.nodeIdMap[nodeID] = thisNode
 		newss.nodesList = append(newss.nodesList, thisNode)
 		newss.serverFull = make(chan int, 1)
-		rpc.RegisterName("StorageServer", newss)
+
+		// RPC registration
+		rpc.RegisterName("StorageServer", storagerpc.Wrap(newss))
 		rpc.HandleHTTP()
 
 		listener, err := net.Listen("tcp", newss.hostport)
@@ -100,7 +102,7 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 
 		newss.nodesList = registerReply.Servers
 
-		rpc.RegisterName("StorageServer", newss)
+		rpc.RegisterName("StorageServer", storagerpc.Wrap(newss))
 		rpc.HandleHTTP()
 
 		listener, err3 := net.Listen("tcp", newss.hostport)
@@ -212,6 +214,7 @@ func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.Get
 		reply.Value = rst
 		reply.Status = storagerpc.OK
 	} else {
+		reply.Value = make([]string, 0, 0)
 		reply.Status = storagerpc.KeyNotFound
 	}
 	return nil

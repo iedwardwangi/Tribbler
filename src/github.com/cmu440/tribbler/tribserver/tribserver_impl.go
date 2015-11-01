@@ -1,15 +1,22 @@
 package tribserver
 
 import (
+	"encoding/json"
 	"errors"
+	"github.com/cmu440/tribbler/libstore"
 	"github.com/cmu440/tribbler/rpc/tribrpc"
-	"math"
+	"github.com/cmu440/tribbler/util"
+	"net"
+	"net/http"
+	"net/rpc"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 )
 
 type tribServer struct {
-	// TODO: implement this!
+	ls libstore.Libstore
 }
 
 type tribbleIDs []string
@@ -22,26 +29,18 @@ func (tribIdList tribbleIDs) Less(i, j int) bool {
 	// For string i
 	si := tribIdList[i]
 	pi0 := strings.Index(si, ":")
-	si = si[pi0+1:]
-	pi1 := strings.Index(si, "_") + pi0 + 1
+	pi1 := strings.Index(si[pi0+1:], "_") + pi0 + 1
 	pi2 := strings.Index(si[pi1+1:], "_") + pi1 + 1
-	postTime_i, _ := strconv.Atoi(si[pi1+1 : pi2])
-	tieBreaker_i, _ := strconv.Atoi(si[pi2+1:])
+	postTime_i, _ := strconv.ParseInt("0x"+si[pi1+1:pi2], 0, 64)
 
 	// For string j
 	sj := tribIdList[j]
 	pj0 := strings.Index(sj, ":")
-	sj = si[pj0+1:]
-	pj1 := strings.Index(sj, "_") + pj0 + 1
+	pj1 := strings.Index(sj[pj0+1:], "_") + pj0 + 1
 	pj2 := strings.Index(sj[pj1+1:], "_") + pj1 + 1
-	postTime_j, _ := strconv.Atoi(sj[pj1+1 : pj2])
-	tieBreaker_j, _ := strconv.Atoi(sj[pj2+1:])
+	postTime_j, _ := strconv.ParseInt("0x"+sj[pj1+1:pj2], 0, 64)
 
-	if postTime_i == postTime_j {
-		return tieBreaker_i > tieBreaker_j
-	} else {
-		return postTime_i > postTime_j // Because we want reverse order
-	}
+	return postTime_i > postTime_j // Because we want reverse order
 }
 
 func (tribIdList tribbleIDs) Swap(i, j int) {
@@ -55,7 +54,27 @@ func (tribIdList tribbleIDs) Swap(i, j int) {
 //
 // For hints on how to properly setup RPC, see the rpc/tribrpc package.
 func NewTribServer(masterServerHostPort, myHostPort string) (TribServer, error) {
-	return nil, errors.New("not implemented")
+	libstore, err := libstore.NewLibstore(masterServerHostPort, myHostPort, libstore.Never)
+	if err != nil {
+		return nil, errors.New("Creating new libstore failed")
+	}
+	newTribServer := &tribServer{
+		ls: libstore,
+	}
+
+	listener, err := net.Listen("tcp", myHostPort)
+	if err != nil {
+		return nil, err
+	}
+
+	err = rpc.RegisterName("TribServer", tribrpc.Wrap(newTribServer))
+	if err != nil {
+		return nil, err
+	}
+	rpc.HandleHTTP()
+	go http.Serve(listener, nil)
+
+	return newTribServer, nil
 }
 
 func (ts *tribServer) CreateUser(args *tribrpc.CreateUserArgs, reply *tribrpc.CreateUserReply) error {
@@ -65,7 +84,7 @@ func (ts *tribServer) CreateUser(args *tribrpc.CreateUserArgs, reply *tribrpc.Cr
 
 	if err == nil {
 		reply.Status = tribrpc.Exists
-		return errors.New("User already existed.")
+		return nil
 	}
 
 	err2 := ts.ls.Put(useridkey, userid)
@@ -86,23 +105,24 @@ func (ts *tribServer) AddSubscription(args *tribrpc.SubscriptionArgs, reply *tri
 
 	_, userExists := ts.ls.Get(useridkey)
 
-	if userExists == nil {
+	if userExists != nil {
 		reply.Status = tribrpc.NoSuchUser
-		return errors.New("No such user.")
+		return nil
 	}
 
 	_, targetExists := ts.ls.Get(targetidkey)
 
-	if targetExists == nil {
+	if targetExists != nil {
 		reply.Status = tribrpc.NoSuchTargetUser
-		return errors.New("No such target user.")
+		return nil
 	}
 
 	userSubListKey := util.FormatSubListKey(userid)
 	appendErr := ts.ls.AppendToList(userSubListKey, targetid)
 
 	if appendErr != nil {
-		return appendErr
+		reply.Status = tribrpc.Exists
+		return nil
 	}
 
 	reply.Status = tribrpc.OK
@@ -117,23 +137,24 @@ func (ts *tribServer) RemoveSubscription(args *tribrpc.SubscriptionArgs, reply *
 
 	_, userExists := ts.ls.Get(useridkey)
 
-	if userExists == nil {
+	if userExists != nil {
 		reply.Status = tribrpc.NoSuchUser
-		return errors.New("No such user.")
+		return nil
 	}
 
 	_, targetExists := ts.ls.Get(targetidkey)
 
-	if targetExists == nil {
+	if targetExists != nil {
 		reply.Status = tribrpc.NoSuchTargetUser
-		return errors.New("No such target user.")
+		return nil
 	}
 
 	userSubListKey := util.FormatSubListKey(userid)
 	removeErr := ts.ls.RemoveFromList(userSubListKey, targetid)
 
 	if removeErr != nil {
-		return removeErr
+		reply.Status = tribrpc.NoSuchTargetUser
+		return nil
 	}
 
 	reply.Status = tribrpc.OK
@@ -146,9 +167,9 @@ func (ts *tribServer) GetSubscriptions(args *tribrpc.GetSubscriptionsArgs, reply
 
 	_, userExists := ts.ls.Get(useridkey)
 
-	if userExists == nil {
+	if userExists != nil {
 		reply.Status = tribrpc.NoSuchUser
-		return errors.New("No such user.")
+		return nil
 	}
 
 	userSubListKey := util.FormatSubListKey(userid)
@@ -157,7 +178,7 @@ func (ts *tribServer) GetSubscriptions(args *tribrpc.GetSubscriptionsArgs, reply
 	if err != nil {
 		reply.Status = tribrpc.OK
 		reply.UserIDs = nil
-		return err
+		return nil
 	}
 
 	reply.Status = tribrpc.OK
@@ -166,11 +187,72 @@ func (ts *tribServer) GetSubscriptions(args *tribrpc.GetSubscriptionsArgs, reply
 }
 
 func (ts *tribServer) PostTribble(args *tribrpc.PostTribbleArgs, reply *tribrpc.PostTribbleReply) error {
-	return errors.New("not implemented")
+	if args == nil {
+		return errors.New("ts: Can't post nil")
+	}
+	if reply == nil {
+		return errors.New("ts: Can't reply with nil in Post")
+	}
+
+	curTime := time.Now()
+	_, err := ts.ls.Get(util.FormatUserKey(args.UserID))
+	if err != nil {
+		reply.Status = tribrpc.NoSuchUser
+		reply.PostKey = ""
+		return nil
+	}
+
+	newTribID := util.FormatPostKey(args.UserID, curTime.UnixNano())
+
+	for ts.ls.AppendToList(util.FormatTribListKey(args.UserID), newTribID) != nil {
+		newTribID = util.FormatPostKey(args.UserID, curTime.UnixNano())
+	}
+
+	trb := &tribrpc.Tribble{
+		UserID:   args.UserID,
+		Posted:   curTime,
+		Contents: args.Contents,
+	}
+
+	marshaled, _ := json.Marshal(trb)
+	if ts.ls.Put(newTribID, string(marshaled[:])) != nil {
+		ts.ls.RemoveFromList(util.FormatTribListKey(args.UserID), newTribID)
+		reply.Status = tribrpc.NoSuchUser
+		reply.PostKey = ""
+		return errors.New("Fatal, failed to add new post")
+	}
+
+	reply.Status = tribrpc.OK
+	reply.PostKey = newTribID
+	return nil
 }
 
 func (ts *tribServer) DeleteTribble(args *tribrpc.DeleteTribbleArgs, reply *tribrpc.DeleteTribbleReply) error {
-	return errors.New("not implemented")
+	if args == nil {
+		return errors.New("ts: Can't delete nil")
+	}
+	if reply == nil {
+		return errors.New("ts: Can't reply with nil in Delete")
+	}
+
+	_, err := ts.ls.Get(util.FormatUserKey(args.UserID))
+	if err != nil {
+		reply.Status = tribrpc.NoSuchUser
+		return nil
+	}
+
+	err = ts.ls.RemoveFromList(util.FormatTribListKey(args.UserID), args.PostKey)
+	if err != nil {
+		reply.Status = tribrpc.NoSuchPost
+		return nil
+	}
+	if ts.ls.Delete(args.PostKey) != nil {
+		reply.Status = tribrpc.NoSuchPost
+		return errors.New("Fatal, failed to delete a key")
+	}
+
+	reply.Status = tribrpc.OK
+	return nil
 }
 
 func (ts *tribServer) GetTribbles(args *tribrpc.GetTribblesArgs, reply *tribrpc.GetTribblesReply) error {
@@ -179,9 +261,9 @@ func (ts *tribServer) GetTribbles(args *tribrpc.GetTribblesArgs, reply *tribrpc.
 
 	_, userExists := ts.ls.Get(useridkey)
 
-	if userExists == nil {
+	if userExists != nil {
 		reply.Status = tribrpc.NoSuchUser
-		return errors.New("No such user.")
+		return nil
 	}
 
 	userTribListKey := util.FormatTribListKey(userid)
@@ -198,7 +280,10 @@ func (ts *tribServer) GetTribbles(args *tribrpc.GetTribblesArgs, reply *tribrpc.
 	tribbleIdsChrono := []string(tmp)
 
 	// Calculate the length of the tribbles we want to get
-	length := math.Min(len(tribbleIdsChrono), 100)
+	length := 100
+	if len(tribbleIdsChrono) < 100 {
+		length = len(tribbleIdsChrono)
+	}
 	allTribbles := make([]tribrpc.Tribble, length)
 	var tribTmp tribrpc.Tribble
 	i := 0
@@ -206,7 +291,7 @@ func (ts *tribServer) GetTribbles(args *tribrpc.GetTribblesArgs, reply *tribrpc.
 		trib, err := ts.ls.Get(tribbleIdsChrono[i])
 		if err == nil {
 			json.Unmarshal([]byte(trib), &tribTmp)
-			allTribbles[i] = trib
+			allTribbles[i] = tribTmp
 			i += 1 // If error occurs, we do NOT increment i
 		}
 	}
@@ -219,5 +304,57 @@ func (ts *tribServer) GetTribbles(args *tribrpc.GetTribblesArgs, reply *tribrpc.
 }
 
 func (ts *tribServer) GetTribblesBySubscription(args *tribrpc.GetTribblesArgs, reply *tribrpc.GetTribblesReply) error {
-	return errors.New("not implemented")
+	if args == nil {
+		return errors.New("ts: Can't getSubscription nil")
+	}
+	if reply == nil {
+		return errors.New("ts: Can't reply with nil in getSubscription")
+	}
+
+	_, err := ts.ls.Get(util.FormatUserKey(args.UserID))
+	if err != nil {
+		reply.Status = tribrpc.NoSuchUser
+		reply.Tribbles = make([]tribrpc.Tribble, 0, 0)
+		return nil
+	}
+
+	users, err := ts.ls.GetList(util.FormatSubListKey(args.UserID))
+	if err != nil {
+		reply.Status = tribrpc.OK
+		reply.Tribbles = make([]tribrpc.Tribble, 0, 0)
+		return nil
+	}
+
+	postIDs := make([]string, 0)
+	for _, userID := range users {
+		lst, err := ts.ls.GetList(util.FormatTribListKey(userID))
+		if err == nil {
+			postIDs = append(postIDs, lst...)
+		}
+	}
+
+	tmp := tribbleIDs(postIDs)
+
+	sort.Sort(tmp)
+	tribbleIdsChrono := []string(tmp)
+
+	length := 100
+	if len(tribbleIdsChrono) < 100 {
+		length = len(tribbleIdsChrono)
+	}
+
+	tribbles := make([]tribrpc.Tribble, length)
+	var tribTmp tribrpc.Tribble
+	i := 0
+	for i < length {
+		trib, err := ts.ls.Get(tribbleIdsChrono[i])
+		if err == nil {
+			json.Unmarshal([]byte(trib), &tribTmp)
+			tribbles[i] = tribTmp
+			i += 1 // If error occurs, we do NOT increment i
+		}
+	}
+	reply.Status = tribrpc.OK
+	reply.Tribbles = tribbles
+	return nil
 }
