@@ -30,6 +30,7 @@ type storageServer struct {
     nodesList []storagerpc.Node
     storageServerReady bool
     serverFull chan int
+    nodeSize int
 }
 
 func PrintError(s string) {
@@ -53,14 +54,16 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
         sMap: make(map[string]*sValue),
         lMap: make(map[string]*lValue),
         storageServerReady: false,  
+        nodeSize: numNodes,
     }
 
     if len(masterServerHostPort) == 0 {
         // Master Storage Server to be created. First "join" itself.
         newss.nodeIdMap = make(map[uint32]storagerpc.Node)
         newss.nodesList = make([]storagerpc.Node, numNodes)
-        newss.nodeIdMap[nodeID]
-        append(newss.nodesList, storagerpc.Node{newss.hostport, nodeID})
+        thisNode := storagerpc.Node{newss.hostport, nodeID}
+        newss.nodeIdMap[nodeID] = thisNode
+        append(newss.nodesList, thisNode)
         newss.serverFull = make(chan int, 1)
         rpc.RegisterName("StorageServer", newss)
         rpc.HandleHTTP()
@@ -114,11 +117,32 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 }
 
 func (ss *storageServer) RegisterServer(args *storagerpc.RegisterArgs, reply *storagerpc.RegisterReply) error {
-    return errors.New("not implemented")
+	serverInfo := args.ServerInfo
+	slave, ok := ss.nodeIdMap[serverInfo.NodeID]
+	if !ok {
+		ss.nodeIdMap[serverinfo.NodeID] = args.ServerInfo
+		append(newss.nodesList, args.ServerInfo)
+	}
+
+	if len(ss.nodeIdMap) < ss.nodeSize {
+		reply.Status = storagerpc.NotReady
+	} else {
+		reply.Statis = storagerpc.OK
+		reply.Servers = ss.nodesList
+		ss.serverFull <- 1
+	}
+    return nil
 }
 
 func (ss *storageServer) GetServers(args *storagerpc.GetServersArgs, reply *storagerpc.GetServersReply) error {
-    return errors.New("not implemented")
+	if ss.storageServerReady {
+		reply.Status = storagerpc.OK
+		reply.Servers = ss.nodesList
+	} else {
+		reply.Status = storagerpc.NotReady
+	}
+
+    return nil
 }
 
 func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetReply) error {
