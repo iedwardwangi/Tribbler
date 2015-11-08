@@ -8,8 +8,24 @@ import (
 
 type libstore struct {
 	// TODO: extends to many servers
-	svr        *rpc.Client
-	myHostPort string
+	master         *rpc.Client
+	svrMap         map[uint32]*rpc.Client // map from NodeID to rpc.Client (which we can call)
+	allServerNodes []storagerpc.Node
+	myHostPort     string
+}
+
+type nodes []storagerpc.Node
+
+func (nodeList nodes) Len() int {
+	return len(nodeList)
+}
+
+func (nodeList nodes) Less(i, j int) bool {
+	return nodeList[i].NodeID < nodeList[j].NodeID
+}
+
+func (nodeList nodes) Swap(i, j int) {
+	nodeList[i], nodeList[j] = nodeList[j], nodeList[i]
 }
 
 // NewLibstore creates a new instance of a TribServer's libstore. masterServerHostPort
@@ -37,14 +53,40 @@ type libstore struct {
 // need to create a brand new HTTP handler to serve the requests (the Libstore may
 // simply reuse the TribServer's HTTP handler since the two run in the same process).
 func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libstore, error) {
-	svr, err := rpc.DialHTTP("tcp", masterServerHostPort)
+	master, err := rpc.DialHTTP("tcp", masterServerHostPort)
 	if err != nil {
 		return nil, err
 	}
-	newLib := &libstore{
-		svr:        svr,
-		myHostPort: myHostPort,
+
+	args := &storagerpc.GetServersArgs{}
+	var reply *storagerpc.GetServersReply
+
+	for i := 0; i < 5; i++ {
+		master.Call("StorageServer.GetServers", args, &reply)
+		if reply.Status == storagerpc.OK {
+			break
+		} else {
+			time.Sleep(time.Second)
+		}
 	}
+
+	if reply.Status != storagerpc.OK {
+		return nil, nil // After retry for 5 times...
+	}
+
+	nodeList := nodes(reply.Servers)
+	sort.Sort(nodeList)
+	nodeListSorted := ([]storagerpc.Node)(nodeList)
+
+	newLib := &libstore{
+		master:         master,
+		svrMap:         make(map[uint32]*rpc.Client),
+		myHostPort:     myHostPort,
+		allServerNodes: nodeListSorted,
+	}
+
+	// TODO: Add cache initialization, cache lock and queries counter
+
 	return newLib, nil
 }
 
@@ -118,9 +160,43 @@ func (ls *libstore) GetList(key string) ([]string, error) {
 	return reply.Value, nil
 }
 
+/*
+ * GetStorageServer: Givern a key (string), return the rpc.Client that will be used
+ * to call the corresponding remote storage server.
+ */
 func (ls *libstore) GetStorageServer(key string) (*rpc.Client, error) {
 	// TODO: that as well.
-	return ls.svr, nil
+	hashedKeyValue := StoreHash(key)
+	ssNode := ls.allServerNodes[ls.GetStorageServerId(hashedKeyValue)]
+
+	svr, ok := ls.svrMap[ssNode.NodeID]
+	if !ok {
+		var err error
+		svr, err = rpc.DialHTTP("tcp", ssNode.HostPort)
+		if err != nil {
+			return nil, err
+		}
+
+		ls.svrMap[ssNode.NodeID] = svr
+		return svr, nil
+	}
+	return svr, nil
+}
+
+func (ls *libstore) GetStorageServerId(hashedValue uint32) uint32 {
+	serverId := 0
+
+	// Note: ls.allServerNodes is SORTED.
+	for i := 0; i < len(ls.allServerNodes); i++ {
+		if hashedValue > ls.allServerNodes[i].NodeID && ls.allServerNodes[i+1].NodeID {
+			serverId = i + 1
+			break
+		}
+
+		if i == len(ls.allServerNodes)-1 {
+			return 0
+		}
+	}
 }
 
 func (ls *libstore) RemoveFromList(key, removeItem string) error {
