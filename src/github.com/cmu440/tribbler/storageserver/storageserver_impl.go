@@ -300,6 +300,8 @@ func (ss *storageServer) Delete(args *storagerpc.DeleteArgs, reply *storagerpc.D
 	ss.sMutex.Unlock()
 
 	keyLock.Lock()
+	defer keyLock.Unlock()
+
 	_, ok := ss.sMap[args.Key]
 
 	if !ok {
@@ -325,8 +327,6 @@ func (ss *storageServer) Delete(args *storagerpc.DeleteArgs, reply *storagerpc.D
 
 	delete(ss.sMap, args.Key)
 	reply.Status = storagerpc.OK
-
-	keyLock.Unlock()
 	return nil
 }
 
@@ -398,6 +398,8 @@ func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutRepl
 	ss.sMutex.Unlock()
 
 	keyLock.Lock()
+	defer keyLock.Unlock()
+
 	_, ok := ss.sMap[args.Key]
 
 	if !ok {
@@ -426,8 +428,6 @@ func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutRepl
 	}
 	ss.sMap[args.Key] = &newValue
 	reply.Status = storagerpc.OK
-
-	keyLock.Unlock()
 	return nil
 }
 
@@ -453,6 +453,8 @@ func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerp
 	ss.sMutex.Unlock()
 
 	keyLock.Lock()
+	defer keyLock.Unlock()
+
 	hpTimeMap, leaseExists := ss.leaseMap[args.Key]
 	if leaseExists {
 		// Revoke all issued leases.
@@ -486,8 +488,6 @@ func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerp
 		ss.lMap[args.Key] = &newValue
 	}
 	reply.Status = storagerpc.OK
-
-	keyLock.Unlock()
 	return nil
 }
 
@@ -513,6 +513,7 @@ func (ss *storageServer) RemoveFromList(args *storagerpc.PutArgs, reply *storage
 	ss.sMutex.Unlock()
 
 	keyLock.Lock()
+	defer keyLock.Unlock()
 
 	hpTimeMap, leaseExists := ss.leaseMap[args.Key]
 	if leaseExists {
@@ -541,8 +542,6 @@ func (ss *storageServer) RemoveFromList(args *storagerpc.PutArgs, reply *storage
 		}
 	}
 	reply.Status = storagerpc.ItemNotFound
-
-	keyLock.Unlock()
 	return nil
 }
 
