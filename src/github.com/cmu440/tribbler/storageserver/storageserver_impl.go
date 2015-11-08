@@ -27,6 +27,7 @@ type storageServer struct {
 	nodeId             uint32
 	sMutex             *sync.Mutex // Mutex for single value map
 	lMutex             *sync.Mutex // Mutex for list value map
+	mMutex             *sync.Mutex // Mutex for libStoreMap
 	sMap               map[string]*sValue
 	lMap               map[string]*lValue
 	nodeIdMap          map[uint32]storagerpc.Node        // Map from node id to the node info (port, id)
@@ -67,6 +68,7 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		nodeId:             nodeID,
 		sMutex:             &sync.Mutex{},
 		lMutex:             &sync.Mutex{},
+		mMutex:             &sync.Mutex{},
 		sMap:               make(map[string]*sValue),
 		lMap:               make(map[string]*lValue),
 		leaseMap:           make(map[string](map[string]time.Time)),
@@ -97,7 +99,9 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 
 		// Keep listening to connection requests
 		go http.Serve(listener, nil)
-
+		if numNodes == 1 {
+			newss.serverFull <- 1
+		}
 		<-newss.serverFull
 		newss.storageServerReady = true
 
@@ -105,6 +109,7 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		// Slave Storage Server to be created. First "dial" the master.
 		client, err2 := rpc.DialHTTP("tcp", masterServerHostPort)
 		if err2 != nil {
+			fmt.Println("Error:", err2)
 			return nil, errors.New("")
 		}
 
@@ -154,14 +159,13 @@ func (ss *storageServer) CheckKeyInRange(key string) bool {
 			break
 		}
 	}
-
-	return uint32(serverId) == ss.nodeId
+	return ss.nodesList[serverId].NodeID == ss.nodeId
 }
 
 func (ss *storageServer) CheckLease() {
 	expiration := time.Duration(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds) * time.Second
 	for {
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 		for k, hostTimeMap := range ss.leaseMap {
 			for hp, tt := range hostTimeMap {
 				if time.Since(tt) > expiration {
@@ -184,7 +188,7 @@ func (ss *storageServer) CheckRevokeStatus(key string, successChan, finishChan c
 				finishChan <- 1
 				return
 			}
-		case <-time.After(time.Second):
+		case <-time.After(500 * time.Millisecond):
 			if len(ss.leaseMap[key]) == 0 {
 				finishChan <- 1
 				return
@@ -194,20 +198,23 @@ func (ss *storageServer) CheckRevokeStatus(key string, successChan, finishChan c
 }
 
 func (ss *storageServer) RevokeLeaseAt(hostport, key string, successChan chan int) {
+	ss.mMutex.Lock()
 	cli, ok := ss.libStoreMap[hostport]
 	if !ok {
 		var err error
 		cli, err = rpc.DialHTTP("tcp", hostport)
 		if err != nil {
+			ss.mMutex.Unlock()
 			return
 		}
 		ss.libStoreMap[hostport] = cli
 	}
+	ss.mMutex.Unlock()
 
 	args := &storagerpc.RevokeLeaseArgs{key}
 	var reply storagerpc.RevokeLeaseReply
 
-	err2 := cli.Call("LeaseCallbacks", args, &reply)
+	err2 := cli.Call("LeaseCallbacks.RevokeLease", args, &reply)
 	if err2 != nil {
 		return
 	}
@@ -418,13 +425,6 @@ func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutRepl
 	keyLock.Lock()
 	defer keyLock.Unlock()
 
-	_, ok := ss.sMap[args.Key]
-
-	if !ok {
-		reply.Status = storagerpc.KeyNotFound
-		return nil
-	}
-
 	hpTimeMap, leaseExists := ss.leaseMap[args.Key]
 	if leaseExists {
 		// Revoke all issued leases.
@@ -437,13 +437,13 @@ func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutRepl
 		}
 
 		<-finishChan
-
 		delete(ss.leaseMap, args.Key)
 	}
 
 	newValue := sValue{
 		value: args.Value,
 	}
+
 	ss.sMap[args.Key] = &newValue
 	reply.Status = storagerpc.OK
 	return nil
