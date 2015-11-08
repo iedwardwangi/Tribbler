@@ -3,10 +3,12 @@ package storageserver
 import (
 	"errors"
 	"fmt"
+	"github.com/cmu440/tribbler/libstore"
 	"github.com/cmu440/tribbler/rpc/storagerpc"
 	"net"
 	"net/http"
 	"net/rpc"
+	"sort"
 	"sync"
 	"time"
 )
@@ -27,15 +29,28 @@ type storageServer struct {
 	lMutex             *sync.Mutex // Mutex for list value map
 	sMap               map[string]*sValue
 	lMap               map[string]*lValue
-	nodeIdMap          map[uint32]storagerpc.Node // Map from node id to the node info (port, id)
+	nodeIdMap          map[uint32]storagerpc.Node        // Map from node id to the node info (port, id)
+	leaseMap           map[string](map[string]time.Time) // SUBJECT TO CHANGE
+	keyLockMap         map[string]*sync.Mutex
 	nodesList          []storagerpc.Node
+	libStoreMap        map[string]*rpc.Client
 	storageServerReady bool
 	serverFull         chan int
 	nodeSize           int
 }
 
-func PrintError(s string) {
-	fmt.Println("Error:", s)
+type nodes []storagerpc.Node
+
+func (nodeList nodes) Len() int {
+	return len(nodeList)
+}
+
+func (nodeList nodes) Less(i, j int) bool {
+	return nodeList[i].NodeID < nodeList[j].NodeID
+}
+
+func (nodeList nodes) Swap(i, j int) {
+	nodeList[i], nodeList[j] = nodeList[j], nodeList[i]
 }
 
 // NewStorageServer creates and starts a new StorageServer. masterServerHostPort
@@ -54,7 +69,10 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		lMutex:             &sync.Mutex{},
 		sMap:               make(map[string]*sValue),
 		lMap:               make(map[string]*lValue),
+		leaseMap:           make(map[string](map[string]time.Time)),
+		keyLockMap:         make(map[string]*sync.Mutex),
 		storageServerReady: false,
+		libStoreMap:        make(map[string]*rpc.Client),
 		nodeSize:           numNodes,
 	}
 
@@ -82,7 +100,7 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 
 		<-newss.serverFull
 		newss.storageServerReady = true
-		return newss, nil
+
 	} else {
 		// Slave Storage Server to be created. First "dial" the master.
 		client, err2 := rpc.DialHTTP("tcp", masterServerHostPort)
@@ -113,9 +131,69 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 
 		go http.Serve(listener, nil)
 		newss.storageServerReady = true
-		return newss, nil
-
 	}
+
+	tmp := nodes(newss.nodesList)
+	sort.Sort(tmp)
+	newss.nodesList = ([]storagerpc.Node)(tmp)
+	go newss.CheckLease()
+	return newss, nil
+}
+
+func (ss *storageServer) CheckLease() {
+	expiration := time.Duration(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds) * time.Second
+	for {
+		time.Sleep(500 * time.Millisecond)
+		for k, hostTimeMap := range ss.leaseMap {
+			for hp, tt := range hostTimeMap {
+				if time.Since(tt) > expiration {
+					delete(ss.leaseMap[k], hp)
+				}
+			}
+		}
+	}
+}
+
+func (ss *storageServer) CheckRevokeStatus(key string, successChan, finishChan chan int, expected int) {
+	count := 0
+	for {
+		select {
+		case <-successChan:
+			count += 1
+			lenMap := len(ss.leaseMap[key])
+			if count == expected || lenMap == 0 {
+				// Either all replied, or all expired
+				finishChan <- 1
+				return
+			}
+		case <-time.After(time.Second):
+			if len(ss.leaseMap[key]) == 0 {
+				finishChan <- 1
+				return
+			}
+		}
+	}
+}
+
+func (ss *storageServer) RevokeLeaseAt(hostport, key string, successChan chan int) {
+	cli, ok := ss.libStoreMap[hostport]
+	if !ok {
+		var err error
+		cli, err = rpc.DialHTTP("tcp", hostport)
+		if err != nil {
+			return
+		}
+		ss.libStoreMap[hostport] = cli
+	}
+
+	args := &storagerpc.RevokeLeaseArgs{key}
+	var reply storagerpc.RevokeLeaseReply
+
+	err2 := cli.Call("LeaseCallbacks", args, &reply)
+	if err2 != nil {
+		return
+	}
+	successChan <- 1
 }
 
 func (ss *storageServer) RegisterServer(args *storagerpc.RegisterArgs, reply *storagerpc.RegisterReply) error {
@@ -156,10 +234,39 @@ func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetRepl
 	if reply == nil {
 		return errors.New("ss: Can't reply with nil in Get")
 	}
-	ss.sMutex.Lock()
-	defer ss.sMutex.Unlock()
+	if !(ss.CheckKeyInRange(args.Key)) {
+		reply.Status = storagerpc.WrongServer
+		return nil
+	}
 
-	// TODO: check key in range for the server
+	// Step 1: Lock the keyLockMap access so as to find the lock for this specific key.
+	ss.sMutex.Lock()
+	keyLock, exist := ss.keyLockMap[args.Key]
+	if !exist {
+		// Create new lock for the key
+		keyLock = &sync.Mutex{}
+		ss.keyLockMap[args.Key] = keyLock
+	}
+	ss.sMutex.Unlock()
+
+	// Step 2: Release the sMutex lock so that the ss can serve other GET requests.
+	// Meanwhile, since we are dealing with lease related to args.Key, we must lock
+	// it using its own lock, keyLock.
+	granted := false
+	keyLock.Lock()
+	defer keyLock.Unlock()
+
+	if args.WantLease {
+		leasedLibStores, ok := ss.leaseMap[args.Key]
+		if !ok {
+			leasedLibStores = make(map[string]time.Time)
+			ss.leaseMap[args.Key] = leasedLibStores
+		}
+		ss.leaseMap[args.Key][args.HostPort] = time.Now()
+		granted = true
+
+	}
+	reply.Lease = storagerpc.Lease{granted, storagerpc.LeaseSeconds}
 
 	val, ok := ss.sMap[args.Key]
 	if ok {
@@ -178,19 +285,48 @@ func (ss *storageServer) Delete(args *storagerpc.DeleteArgs, reply *storagerpc.D
 	if reply == nil {
 		return errors.New("ss: Can't reply with nil in Delete")
 	}
-	ss.sMutex.Lock()
-	defer ss.sMutex.Unlock()
-
-	// TODO: check key in range for the server
-
-	_, ok := ss.sMap[args.Key]
-	if ok {
-		delete(ss.sMap, args.Key)
-		reply.Status = storagerpc.OK
-	} else {
-		reply.Status = storagerpc.KeyNotFound
+	if !(ss.CheckKeyInRange(args.Key)) {
+		reply.Status = storagerpc.WrongServer
+		return nil
 	}
 
+	ss.sMutex.Lock()
+	keyLock, exist := ss.keyLockMap[args.Key]
+	if !exist {
+		// Create new lock for the key
+		keyLock = &sync.Mutex{}
+		ss.keyLockMap[args.Key] = keyLock
+	}
+	ss.sMutex.Unlock()
+
+	keyLock.Lock()
+	_, ok := ss.sMap[args.Key]
+
+	if !ok {
+		reply.Status = storagerpc.KeyNotFound
+		return nil
+	}
+
+	hpTimeMap, leaseExists := ss.leaseMap[args.Key]
+	if leaseExists {
+		// Revoke all issued leases.
+		successChan := make(chan int, 1)
+		finishChan := make(chan int, 1)
+		expected := len(hpTimeMap)
+		go ss.CheckRevokeStatus(args.Key, successChan, finishChan, expected)
+		for hp, _ := range hpTimeMap {
+			go ss.RevokeLeaseAt(hp, args.Key, successChan)
+		}
+
+		<-finishChan
+
+		delete(ss.leaseMap, args.Key)
+	}
+
+	delete(ss.sMap, args.Key)
+	reply.Status = storagerpc.OK
+
+	keyLock.Unlock()
 	return nil
 }
 
@@ -201,10 +337,35 @@ func (ss *storageServer) GetList(args *storagerpc.GetArgs, reply *storagerpc.Get
 	if reply == nil {
 		return errors.New("ss: Can't reply with nil in GetList")
 	}
-	ss.lMutex.Lock()
-	defer ss.lMutex.Unlock()
+	if !(ss.CheckKeyInRange(args.Key)) {
+		reply.Status = storagerpc.WrongServer
+		return nil
+	}
 
-	// TODO: check key in range for the server
+	ss.sMutex.Lock()
+	keyLock, exist := ss.keyLockMap[args.Key]
+	if !exist {
+		// Create new lock for the key
+		keyLock = &sync.Mutex{}
+		ss.keyLockMap[args.Key] = keyLock
+	}
+	ss.sMutex.Unlock()
+
+	granted := false
+	keyLock.Lock()
+	defer keyLock.Unlock()
+
+	if args.WantLease {
+		leasedLibStores, ok := ss.leaseMap[args.Key]
+		if !ok {
+			leasedLibStores = make(map[string]time.Time)
+			ss.leaseMap[args.Key] = leasedLibStores
+		}
+		ss.leaseMap[args.Key][args.HostPort] = time.Now()
+		granted = true
+
+	}
+	reply.Lease = storagerpc.Lease{granted, storagerpc.LeaseSeconds}
 
 	lst, ok := ss.lMap[args.Key]
 	if ok {
@@ -228,15 +389,45 @@ func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutRepl
 		return errors.New("ss: Can't reply with nil in Put")
 	}
 	ss.sMutex.Lock()
-	defer ss.sMutex.Unlock()
+	keyLock, exist := ss.keyLockMap[args.Key]
+	if !exist {
+		// Create new lock for the key
+		keyLock = &sync.Mutex{}
+		ss.keyLockMap[args.Key] = keyLock
+	}
+	ss.sMutex.Unlock()
 
-	// TODO: check key in range for the server
+	keyLock.Lock()
+	_, ok := ss.sMap[args.Key]
+
+	if !ok {
+		reply.Status = storagerpc.KeyNotFound
+		return nil
+	}
+
+	hpTimeMap, leaseExists := ss.leaseMap[args.Key]
+	if leaseExists {
+		// Revoke all issued leases.
+		successChan := make(chan int, 1)
+		finishChan := make(chan int, 1)
+		expected := len(ss.leaseMap[args.Key])
+		go ss.CheckRevokeStatus(args.Key, successChan, finishChan, expected)
+		for hp, _ := range hpTimeMap {
+			go ss.RevokeLeaseAt(hp, args.Key, successChan)
+		}
+
+		<-finishChan
+
+		delete(ss.leaseMap, args.Key)
+	}
 
 	newValue := sValue{
 		value: args.Value,
 	}
 	ss.sMap[args.Key] = &newValue
 	reply.Status = storagerpc.OK
+
+	keyLock.Unlock()
 	return nil
 }
 
@@ -247,10 +438,36 @@ func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerp
 	if reply == nil {
 		return errors.New("ss: Can't reply with nil in Append")
 	}
-	ss.lMutex.Lock()
-	defer ss.lMutex.Unlock()
+	if !(ss.CheckKeyInRange(args.Key)) {
+		reply.Status = storagerpc.WrongServer
+		return nil
+	}
 
-	// TODO: check key in range for the server
+	ss.sMutex.Lock()
+	keyLock, exist := ss.keyLockMap[args.Key]
+	if !exist {
+		// Create new lock for the key
+		keyLock = &sync.Mutex{}
+		ss.keyLockMap[args.Key] = keyLock
+	}
+	ss.sMutex.Unlock()
+
+	keyLock.Lock()
+	hpTimeMap, leaseExists := ss.leaseMap[args.Key]
+	if leaseExists {
+		// Revoke all issued leases.
+		successChan := make(chan int, 1)
+		finishChan := make(chan int, 1)
+		expected := len(ss.leaseMap[args.Key])
+		go ss.CheckRevokeStatus(args.Key, successChan, finishChan, expected)
+		for hp, _ := range hpTimeMap {
+			go ss.RevokeLeaseAt(hp, args.Key, successChan)
+		}
+
+		<-finishChan
+
+		delete(ss.leaseMap, args.Key)
+	}
 
 	lst, ok := ss.lMap[args.Key]
 	if ok {
@@ -269,6 +486,8 @@ func (ss *storageServer) AppendToList(args *storagerpc.PutArgs, reply *storagerp
 		ss.lMap[args.Key] = &newValue
 	}
 	reply.Status = storagerpc.OK
+
+	keyLock.Unlock()
 	return nil
 }
 
@@ -279,10 +498,37 @@ func (ss *storageServer) RemoveFromList(args *storagerpc.PutArgs, reply *storage
 	if reply == nil {
 		return errors.New("ss: Can't reply with nil in Remove")
 	}
-	ss.lMutex.Lock()
-	defer ss.lMutex.Unlock()
+	if !(ss.CheckKeyInRange(args.Key)) {
+		reply.Status = storagerpc.WrongServer
+		return nil
+	}
 
-	// TODO: check key in range for the server
+	ss.sMutex.Lock()
+	keyLock, exist := ss.keyLockMap[args.Key]
+	if !exist {
+		// Create new lock for the key
+		keyLock = &sync.Mutex{}
+		ss.keyLockMap[args.Key] = keyLock
+	}
+	ss.sMutex.Unlock()
+
+	keyLock.Lock()
+
+	hpTimeMap, leaseExists := ss.leaseMap[args.Key]
+	if leaseExists {
+		// Revoke all issued leases.
+		successChan := make(chan int, 1)
+		finishChan := make(chan int, 1)
+		expected := len(ss.leaseMap[args.Key])
+		go ss.CheckRevokeStatus(args.Key, successChan, finishChan, expected)
+		for hp, _ := range hpTimeMap {
+			go ss.RevokeLeaseAt(hp, args.Key, successChan)
+		}
+
+		<-finishChan
+
+		delete(ss.leaseMap, args.Key)
+	}
 
 	lst, ok := ss.lMap[args.Key]
 	if ok {
@@ -296,5 +542,24 @@ func (ss *storageServer) RemoveFromList(args *storagerpc.PutArgs, reply *storage
 	}
 	reply.Status = storagerpc.ItemNotFound
 
+	keyLock.Unlock()
 	return nil
+}
+
+func (ss *storageServer) CheckKeyInRange(key string) bool {
+	hashedValue := libstore.StoreHash(key)
+	serverId := 0
+
+	for i := 0; i < len(ss.nodesList); i++ {
+		if i == len(ss.nodesList)-1 {
+			serverId = 0
+			break
+		}
+		if hashedValue > ss.nodesList[i].NodeID && hashedValue <= ss.nodesList[i+1].NodeID {
+			serverId = i + 1
+			break
+		}
+	}
+
+	return uint32(serverId) == ss.nodeId
 }
