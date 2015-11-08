@@ -140,6 +140,24 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 	return newss, nil
 }
 
+func (ss *storageServer) CheckKeyInRange(key string) bool {
+	hashedValue := libstore.StoreHash(key)
+	serverId := 0
+
+	for i := 0; i < len(ss.nodesList); i++ {
+		if i == len(ss.nodesList)-1 {
+			serverId = 0
+			break
+		}
+		if hashedValue > ss.nodesList[i].NodeID && hashedValue <= ss.nodesList[i+1].NodeID {
+			serverId = i + 1
+			break
+		}
+	}
+
+	return uint32(serverId) == ss.nodeId
+}
+
 func (ss *storageServer) CheckLease() {
 	expiration := time.Duration(storagerpc.LeaseSeconds+storagerpc.LeaseGuardSeconds) * time.Second
 	for {
@@ -543,22 +561,4 @@ func (ss *storageServer) RemoveFromList(args *storagerpc.PutArgs, reply *storage
 	}
 	reply.Status = storagerpc.ItemNotFound
 	return nil
-}
-
-func (ss *storageServer) CheckKeyInRange(key string) bool {
-	hashedValue := libstore.StoreHash(key)
-	serverId := 0
-
-	for i := 0; i < len(ss.nodesList); i++ {
-		if i == len(ss.nodesList)-1 {
-			serverId = 0
-			break
-		}
-		if hashedValue > ss.nodesList[i].NodeID && hashedValue <= ss.nodesList[i+1].NodeID {
-			serverId = i + 1
-			break
-		}
-	}
-
-	return uint32(serverId) == ss.nodeId
 }
