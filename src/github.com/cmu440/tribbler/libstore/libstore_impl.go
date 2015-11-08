@@ -2,16 +2,42 @@ package libstore
 
 import (
 	"errors"
+	"github.com/cmu440/tribbler/rpc/librpc"
 	"github.com/cmu440/tribbler/rpc/storagerpc"
 	"net/rpc"
+	"sort"
+	"sync"
+	"time"
 )
+
+type sCachNode struct {
+	value   string
+	seconds int
+	isValid bool
+}
+
+type lCachNode struct {
+	value   []string
+	seconds int
+	isValid bool
+}
 
 type libstore struct {
 	// TODO: extends to many servers
 	master         *rpc.Client
 	svrMap         map[uint32]*rpc.Client // map from NodeID to rpc.Client (which we can call)
+	svrMutex       *sync.Mutex
 	allServerNodes []storagerpc.Node
 	myHostPort     string
+	mode           LeaseMode
+
+	// Cache
+	counter      map[string]int
+	counterMutex *sync.Mutex
+	sCache       map[string]*sCachNode
+	sMutex       *sync.Mutex
+	lCache       map[string]*lCachNode
+	lMutex       *sync.Mutex
 }
 
 type nodes []storagerpc.Node
@@ -59,7 +85,7 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 	}
 
 	args := &storagerpc.GetServersArgs{}
-	var reply *storagerpc.GetServersReply
+	var reply storagerpc.GetServersReply
 
 	for i := 0; i < 5; i++ {
 		master.Call("StorageServer.GetServers", args, &reply)
@@ -83,17 +109,104 @@ func NewLibstore(masterServerHostPort, myHostPort string, mode LeaseMode) (Libst
 		svrMap:         make(map[uint32]*rpc.Client),
 		myHostPort:     myHostPort,
 		allServerNodes: nodeListSorted,
+		svrMutex:       &sync.Mutex{},
+		counter:        make(map[string]int),
+		counterMutex:   &sync.Mutex{},
+		sMutex:         &sync.Mutex{},
+		sCache:         make(map[string]*sCachNode),
+		lMutex:         &sync.Mutex{},
+		lCache:         make(map[string]*lCachNode),
+		mode:           mode,
 	}
 
-	// TODO: Add cache initialization, cache lock and queries counter
+	if mode != Never {
+		rpc.RegisterName("LeaseCallbacks", librpc.Wrap(newLib))
+	}
+	go newLib.selfRevoke()
+	go newLib.selfCleanCounter()
 
 	return newLib, nil
 }
 
+func (ls *libstore) selfCleanCounter() {
+	for {
+		time.Sleep(storagerpc.QueryCacheSeconds * time.Second)
+		ls.counterMutex.Lock()
+		for k, _ := range ls.counter {
+			ls.counter[k] = 0
+		}
+		ls.counterMutex.Unlock()
+	}
+}
+
+func (ls *libstore) selfRevoke() {
+	for {
+		time.Sleep(time.Second)
+		ls.sMutex.Lock()
+		for k, v := range ls.sCache {
+			if v.isValid {
+				v.seconds = v.seconds - 1
+				if v.seconds <= 0 {
+					//delete
+					delete(ls.sCache, k)
+				}
+			}
+		}
+		ls.sMutex.Unlock()
+
+		ls.lMutex.Lock()
+		for k, v := range ls.lCache {
+			if v.isValid {
+				v.seconds = v.seconds - 1
+				if v.seconds <= 0 {
+					//delete
+					delete(ls.lCache, k)
+				}
+			}
+		}
+		ls.lMutex.Unlock()
+	}
+}
+
 func (ls *libstore) Get(key string) (string, error) {
-	// TODO: May need to use cache in the future.
-	args := &storagerpc.GetArgs{key, false, ls.myHostPort}
-	var reply *storagerpc.GetReply
+	// Check for cache
+	ls.sMutex.Lock()
+	node, ok := ls.sCache[key]
+	if ok {
+		if node.isValid {
+			rst := node.value
+			ls.sMutex.Unlock()
+			return rst, nil
+		}
+	}
+	ls.sMutex.Unlock()
+
+	// Cache not found, need to increment counter
+	ls.counterMutex.Lock()
+	n, ok := ls.counter[key]
+	if ok {
+		ls.counter[key] = n + 1
+	} else {
+		ls.counter[key] = 1
+	}
+	ls.counterMutex.Unlock()
+
+	var args *storagerpc.GetArgs
+	// TODO: figure out to use n or n-1
+	if ok && n >= storagerpc.QueryCacheThresh {
+		args = &storagerpc.GetArgs{key, true, ls.myHostPort}
+	} else {
+		args = &storagerpc.GetArgs{key, false, ls.myHostPort}
+	}
+
+	if ls.mode == Always {
+		args = &storagerpc.GetArgs{key, true, ls.myHostPort}
+	}
+	if ls.mode == Never {
+		args = &storagerpc.GetArgs{key, false, ls.myHostPort}
+	}
+
+	var reply storagerpc.GetReply
 
 	cli, err := ls.GetStorageServer(key)
 	if err != nil {
@@ -109,14 +222,29 @@ func (ls *libstore) Get(key string) (string, error) {
 		return "", errors.New("Status not OK.")
 	}
 
+	if args.WantLease && reply.Lease.Granted {
+		ls.sMutex.Lock()
+		ls.sCache[key] = &sCachNode{
+			value:   reply.Value,
+			seconds: reply.Lease.ValidSeconds,
+			isValid: true,
+		}
+		ls.sMutex.Unlock()
+	}
+
 	return reply.Value, nil
 }
 
 func (ls *libstore) Put(key, value string) error {
 	args := &storagerpc.PutArgs{key, value}
-	var reply *storagerpc.PutReply
+	var reply storagerpc.PutReply
 
-	err := ls.svr.Call("StorageServer.Put", args, &reply)
+	cli, err := ls.GetStorageServer(key)
+	if err != nil {
+		return err
+	}
+
+	err = cli.Call("StorageServer.Put", args, &reply)
 	if err != nil {
 		return err
 	}
@@ -130,9 +258,14 @@ func (ls *libstore) Put(key, value string) error {
 
 func (ls *libstore) Delete(key string) error {
 	args := &storagerpc.DeleteArgs{key}
-	var reply *storagerpc.DeleteReply
+	var reply storagerpc.DeleteReply
 
-	err := ls.svr.Call("StorageServer.Delete", args, &reply)
+	cli, err := ls.GetStorageServer(key)
+	if err != nil {
+		return err
+	}
+
+	err = cli.Call("StorageServer.Delete", args, &reply)
 	if err != nil {
 		return err
 	}
@@ -145,16 +278,67 @@ func (ls *libstore) Delete(key string) error {
 }
 
 func (ls *libstore) GetList(key string) ([]string, error) {
-	args := &storagerpc.GetArgs{key, false, ls.myHostPort}
-	var reply *storagerpc.GetListReply
+	// Check for cache
+	ls.lMutex.Lock()
+	node, ok := ls.lCache[key]
+	if ok {
+		if node.isValid {
+			rst := node.value
+			ls.lMutex.Unlock()
+			return rst, nil
+		}
+	}
+	ls.lMutex.Unlock()
 
-	err := ls.svr.Call("StorageServer.GetList", args, &reply)
+	// Cache not found, need to increment counter
+	ls.counterMutex.Lock()
+	n, ok := ls.counter[key]
+	if ok {
+		ls.counter[key] = n + 1
+	} else {
+		ls.counter[key] = 1
+	}
+	ls.counterMutex.Unlock()
+
+	var args *storagerpc.GetArgs
+	// TODO: figure out to use n or n-1
+	if ok && n >= storagerpc.QueryCacheThresh {
+		args = &storagerpc.GetArgs{key, true, ls.myHostPort}
+	} else {
+		args = &storagerpc.GetArgs{key, false, ls.myHostPort}
+	}
+
+	if ls.mode == Always {
+		args = &storagerpc.GetArgs{key, true, ls.myHostPort}
+	}
+	if ls.mode == Never {
+		args = &storagerpc.GetArgs{key, false, ls.myHostPort}
+	}
+
+	var reply storagerpc.GetListReply
+
+	cli, err := ls.GetStorageServer(key)
+	if err != nil {
+		return nil, err
+	}
+
+	err = cli.Call("StorageServer.GetList", args, &reply)
 	if err != nil {
 		return nil, err
 	}
 
 	if reply.Status != storagerpc.OK {
 		return nil, errors.New("Status not OK.")
+	}
+
+	if args.WantLease && reply.Lease.Granted {
+		ls.lMutex.Lock()
+		ls.lCache[key] = &lCachNode{
+			value:   reply.Value,
+			seconds: reply.Lease.ValidSeconds,
+			isValid: true,
+		}
+		ls.lMutex.Unlock()
 	}
 
 	return reply.Value, nil
@@ -171,8 +355,11 @@ func (ls *libstore) GetStorageServer(key string) (*rpc.Client, error) {
 
 	svr, ok := ls.svrMap[ssNode.NodeID]
 	if !ok {
-		var err error
-		svr, err = rpc.DialHTTP("tcp", ssNode.HostPort)
+		// Use as write lock only
+		ls.svrMutex.Lock()
+		defer ls.svrMutex.Unlock()
+
+		svr, err := rpc.DialHTTP("tcp", ssNode.HostPort)
 		if err != nil {
 			return nil, err
 		}
@@ -188,22 +375,28 @@ func (ls *libstore) GetStorageServerId(hashedValue uint32) uint32 {
 
 	// Note: ls.allServerNodes is SORTED.
 	for i := 0; i < len(ls.allServerNodes); i++ {
-		if hashedValue > ls.allServerNodes[i].NodeID && ls.allServerNodes[i+1].NodeID {
+		if i == len(ls.allServerNodes)-1 {
+			return 0
+		}
+
+		if hashedValue > ls.allServerNodes[i].NodeID && hashedValue <= ls.allServerNodes[i+1].NodeID {
 			serverId = i + 1
 			break
 		}
 
-		if i == len(ls.allServerNodes)-1 {
-			return 0
-		}
 	}
+	return uint32(serverId)
 }
 
 func (ls *libstore) RemoveFromList(key, removeItem string) error {
 	args := &storagerpc.PutArgs{key, removeItem}
-	var reply *storagerpc.PutReply
+	var reply storagerpc.PutReply
 
-	err := ls.svr.Call("StorageServer.RemoveFromList", args, &reply)
+	cli, err := ls.GetStorageServer(key)
+	if err != nil {
+		return err
+	}
+	err = cli.Call("StorageServer.RemoveFromList", args, &reply)
 	if err != nil {
 		return err
 	}
@@ -217,9 +410,14 @@ func (ls *libstore) RemoveFromList(key, removeItem string) error {
 
 func (ls *libstore) AppendToList(key, newItem string) error {
 	args := &storagerpc.PutArgs{key, newItem}
-	var reply *storagerpc.PutReply
+	var reply storagerpc.PutReply
 
-	err := ls.svr.Call("StorageServer.AppendToList", args, &reply)
+	cli, err := ls.GetStorageServer(key)
+	if err != nil {
+		return err
+	}
+
+	err = cli.Call("StorageServer.AppendToList", args, &reply)
 	if err != nil {
 		return err
 	}
@@ -232,5 +430,27 @@ func (ls *libstore) AppendToList(key, newItem string) error {
 }
 
 func (ls *libstore) RevokeLease(args *storagerpc.RevokeLeaseArgs, reply *storagerpc.RevokeLeaseReply) error {
-	return errors.New("not implemented")
+	ls.sMutex.Lock()
+	_, ok := ls.sCache[args.Key]
+	if ok {
+		delete(ls.sCache, args.Key)
+		ls.sMutex.Unlock()
+		reply.Status = storagerpc.OK
+		return nil
+	}
+	ls.sMutex.Unlock()
+
+	ls.lMutex.Lock()
+	_, ok = ls.lCache[args.Key]
+	if ok {
+		delete(ls.lCache, args.Key)
+		ls.lMutex.Unlock()
+		reply.Status = storagerpc.OK
+		return nil
+	}
+	ls.lMutex.Unlock()
+
+	// Both not found
+	reply.Status = storagerpc.KeyNotFound
+	return nil
 }
