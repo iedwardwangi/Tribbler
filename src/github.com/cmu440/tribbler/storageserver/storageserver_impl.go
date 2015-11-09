@@ -28,6 +28,7 @@ type storageServer struct {
 	sMutex             *sync.Mutex // Mutex for single value map
 	lMutex             *sync.Mutex // Mutex for list value map
 	mMutex             *sync.Mutex // Mutex for libStoreMap
+	cMutex             *sync.Mutex
 	sMap               map[string]*sValue
 	lMap               map[string]*lValue
 	nodeIdMap          map[uint32]storagerpc.Node        // Map from node id to the node info (port, id)
@@ -70,6 +71,7 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		sMutex:             &sync.Mutex{},
 		lMutex:             &sync.Mutex{},
 		mMutex:             &sync.Mutex{},
+		cMutex:             &sync.Mutex{},
 		sMap:               make(map[string]*sValue),
 		lMap:               make(map[string]*lValue),
 		leaseMap:           make(map[string](map[string]time.Time)),
@@ -237,7 +239,9 @@ func (ss *storageServer) RegisterServer(args *storagerpc.RegisterArgs, reply *st
 	} else {
 		reply.Status = storagerpc.OK
 		reply.Servers = ss.nodesList
+		ss.cMutex.Lock()
 		ss.informedCount += 1
+		ss.cMutex.Unlock()
 		if ss.informedCount == ss.nodeSize-1 {
 			ss.serverFull <- 1
 		}
