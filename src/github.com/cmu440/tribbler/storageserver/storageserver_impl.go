@@ -38,6 +38,7 @@ type storageServer struct {
 	storageServerReady bool
 	serverFull         chan int
 	nodeSize           int
+	informedCount      int
 }
 
 type nodes []storagerpc.Node
@@ -86,6 +87,7 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		newss.nodeIdMap[nodeID] = thisNode
 		newss.nodesList = append(newss.nodesList, thisNode)
 		newss.serverFull = make(chan int, 1)
+		newss.informedCount = 0
 
 		// RPC registration
 		rpc.RegisterName("StorageServer", storagerpc.Wrap(newss))
@@ -103,6 +105,7 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 			newss.serverFull <- 1
 		}
 		<-newss.serverFull
+
 		newss.storageServerReady = true
 
 	} else {
@@ -117,7 +120,7 @@ func NewStorageServer(masterServerHostPort string, numNodes, port int, nodeID ui
 		var registerReply storagerpc.RegisterReply
 
 		client.Call("StorageServer.RegisterServer", registerArgs, &registerReply)
-
+		fmt.Println("Start registration.")
 		for registerReply.Status != storagerpc.OK {
 			time.Sleep(time.Second)
 			client.Call("StorageServer.RegisterServer", registerArgs, &registerReply)
@@ -234,7 +237,10 @@ func (ss *storageServer) RegisterServer(args *storagerpc.RegisterArgs, reply *st
 	} else {
 		reply.Status = storagerpc.OK
 		reply.Servers = ss.nodesList
-		ss.serverFull <- 1
+		ss.informedCount += 1
+		if ss.informedCount == ss.nodeSize-1 {
+			ss.serverFull <- 1
+		}
 	}
 	return nil
 }
@@ -294,6 +300,7 @@ func (ss *storageServer) Get(args *storagerpc.GetArgs, reply *storagerpc.GetRepl
 	reply.Lease = storagerpc.Lease{granted, storagerpc.LeaseSeconds}
 
 	val, ok := ss.sMap[args.Key]
+
 	if ok {
 		reply.Value = val.value
 		reply.Status = storagerpc.OK
@@ -443,7 +450,6 @@ func (ss *storageServer) Put(args *storagerpc.PutArgs, reply *storagerpc.PutRepl
 	newValue := sValue{
 		value: args.Value,
 	}
-
 	ss.sMap[args.Key] = &newValue
 	reply.Status = storagerpc.OK
 	return nil

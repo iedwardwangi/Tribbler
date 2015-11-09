@@ -2,6 +2,7 @@ package libstore
 
 import (
 	"errors"
+	"fmt"
 	"github.com/cmu440/tribbler/rpc/librpc"
 	"github.com/cmu440/tribbler/rpc/storagerpc"
 	"net/rpc"
@@ -361,6 +362,7 @@ func (ls *libstore) GetStorageServer(key string) (*rpc.Client, error) {
 
 		svr, err := rpc.DialHTTP("tcp", ssNode.HostPort)
 		if err != nil {
+			fmt.Println("Location 6:", err)
 			return nil, err
 		}
 
